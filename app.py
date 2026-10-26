@@ -699,4 +699,26 @@ function filterTable(mode) {
         return;
     }
     list.forEach(c => {
-        const badge = c.is_same ? `<span class="bg-blue-600 text-white text-[10px] px-2 py-0.5 rounded font-bold">同社區/緊鄰</span>` : `<span class="bg-slate-100 text-slate-600 text-[10px] px
+        const badge = c.is_same ? `<span class="bg-blue-600 text-white text-[10px] px-2 py-0.5 rounded font-bold">同社區/緊鄰</span>` : `<span class="bg-slate-100 text-slate-600 text-[10px] px-2 py-0.5 rounded font-semibold">同路同型態</span>`;
+        const parkNote = c.park > 0 ? `<span class="block text-[10px] text-slate-400">含車位${c.park}萬</span>` : ``;
+        tbody.innerHTML += `
+            <tr class="hover:bg-slate-50 ${c.is_same ? 'bg-blue-50/40' : ''}">
+                <td class="py-3 px-2 whitespace-nowrap">${badge}</td>
+                <td class="py-3 px-2 font-semibold text-slate-600">${c.date}</td>
+                <td class="py-3 px-2 font-bold text-slate-800">${c.addr}</td>
+                <td class="py-3 px-2 text-slate-500 whitespace-nowrap">${c.b_type} (${c.age})</td>
+                <td class="py-3 px-2 text-right font-bold text-blue-700">${c.ping} 坪</td>
+                <td class="py-3 px-2 text-center text-slate-500">${c.floor}</td>
+                <td class="py-3 px-2 text-right font-black text-red-600">${c.unit} 萬/坪</td>
+                <td class="py-3 px-2 text-right font-bold text-slate-900">${c.total.toLocaleString()} 萬 ${parkNote}</td>
+            </tr>`;
+    });
+}
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
