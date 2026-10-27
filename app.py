@@ -251,4 +251,296 @@ def fetch_road_deep_data(city_code: str, road_name: str) -> pd.DataFrame:
     return df
 
 @app.get("/api/analyze")
-def analyze(address: str = Query(...)
+def analyze(address: str = Query(...), custom_ping: float = Query(0), range_ratio: float = Query(0.25)):
+    try:
+        clean_input = normalize_address(address)
+        feat = parse_user_address(clean_input)
+        if not feat:
+            return {"error": "請輸入包含『縣市、路街、號』的完整地址（例：台北市內湖區成功路四段180號6樓）"}
+
+        city_code = "a"
+        for city_name, code in CITY_CODE_MAP.items():
+            if city_name in clean_input or city_name.replace("臺", "台") in address:
+                city_code = code
+                break
+
+        road = feat['road']
+        lane = feat['lane']
+        alley = feat['alley']
+        num = feat['num']
+        target_floor = feat['floor']
+        district = feat['district']
+
+        road_df = fetch_road_deep_data(city_code, road)
+        if road_df.empty:
+            return {"error": f"查無『{district}{road}』之建物與實價資料，請確認縣市與路名是否正確。"}
+
+        if district and not road_df[road_df['district'] == district].empty:
+            road_df = road_df[road_df['district'] == district].copy()
+
+        same_street_df = road_df[(road_df['p_lane'] == lane) & (road_df['p_alley'] == alley)].copy()
+        if same_street_df.empty:
+            same_street_df = road_df[road_df['p_lane'] == lane].copy()
+        if same_street_df.empty:
+            same_street_df = road_df.copy()
+
+        exact_building = same_street_df[same_street_df['p_num'] == num].copy()
+        adj_building = same_street_df[
+            (same_street_df['p_num'] % 2 == num % 2) &
+            ((same_street_df['p_num'] - num).abs() <= 8)
+        ].copy()
+
+        if not exact_building.empty:
+            b_pool = exact_building
+            match_level = f"✅ 已調出本棟門牌【{road}{lane+'巷' if lane else ''}{num}號】建物規格檔案"
+        elif not adj_building.empty:
+            if target_floor > 0:
+                vf = adj_building[adj_building['total_floors_num'] >= target_floor]
+                if not vf.empty:
+                    adj_building = vf
+            adj_building['num_diff'] = (adj_building['p_num'] - num).abs()
+            adj_building = adj_building.sort_values('num_diff')
+            nearest_ym = adj_building.iloc[0]['build_ym']
+            b_pool = adj_building[adj_building['build_ym'] == nearest_ym] if nearest_ym else adj_building
+            match_level = f"✅ 已由同社區連號門牌【{b_pool.iloc[0]['p_num']}號】調出本社區建物規格檔案"
+        else:
+            cand = same_street_df.copy()
+            if target_floor > 0:
+                vf = cand[cand['total_floors_num'] >= target_floor]
+                if not vf.empty:
+                    cand = vf
+            cand['num_diff'] = (cand['p_num'] - num).abs()
+            cand = cand.sort_values('num_diff')
+            nearest_ym = cand.iloc[0]['build_ym']
+            b_pool = cand[cand['build_ym'] == nearest_ym] if nearest_ym else cand.head(5)
+            match_level = f"ℹ️ 已由同路段緊鄰建物【{b_pool.iloc[0]['p_num']}號】推估建物規格（可點選下方房型按鈕切換）"
+
+        ref_b = b_pool.iloc[0]
+        target_build_ym = str(ref_b['build_ym'])
+        target_age = int(ref_b['age']) if ref_b['age'] >= 0 else 15
+        target_total_floors = int(b_pool['total_floors_num'].mode().iloc[0]) if not b_pool['total_floors_num'].mode().empty else int(ref_b['total_floors_num'])
+        b_type = str(ref_b['b_type'])
+        usage = str(ref_b['usage'])
+        mgmt = "有管委會" if "有" in str(ref_b['mgmt']) else "無管委會"
+
+        def is_same_community(row):
+            if row['p_road'] != road or row['p_lane'] != lane:
+                return False
+            if row['p_num'] == num:
+                return True
+            if target_build_ym and len(target_build_ym) >= 5 and row['build_ym'] == target_build_ym:
+                if abs(row['p_num'] - num) <= 50:
+                    return True
+            if (row['p_num'] % 2 == num % 2) and abs(row['p_num'] - num) <= 10:
+                if target_total_floors > 0 and row['total_floors_num'] == target_total_floors and abs(row['age'] - target_age) <= 1:
+                    return True
+            return False
+
+        road_df['is_same_comm'] = road_df.apply(is_same_community, axis=1)
+        comm_all_history = road_df[road_df['is_same_comm']].copy()
+        if comm_all_history.empty:
+            comm_all_history = b_pool.copy()
+
+        comm_pings = comm_all_history[comm_all_history['floor_num'] != 1]['house_ping']
+        if comm_pings.empty:
+            comm_pings = comm_all_history['house_ping']
+
+        ping_options = sorted(list(set(comm_pings.round(0).astype(int).tolist())))
+        merged_options = []
+        for p in ping_options:
+            if not merged_options or (p - merged_options[-1]) >= 3:
+                cluster_val = round(float(comm_pings[(comm_pings >= p - 1.5) & (comm_pings <= p + 1.5)].median()), 1)
+                merged_options.append(cluster_val)
+
+        same_floor_df = comm_all_history[comm_all_history['floor_num'] == target_floor] if target_floor > 0 else pd.DataFrame()
+        if custom_ping > 0:
+            target_ping = custom_ping
+        elif not exact_building[exact_building['floor_num'] == target_floor].empty:
+            target_ping = round(float(exact_building[exact_building['floor_num'] == target_floor].iloc[0]['house_ping']), 1)
+        elif not same_floor_df.empty:
+            target_ping = round(float(same_floor_df['house_ping'].median()), 1)
+        else:
+            target_ping = round(float(comm_pings.median()), 1)
+
+        comm_all_history['ping_diff'] = (comm_all_history['house_ping'] - target_ping).abs()
+        best_spec_row = comm_all_history.sort_values('ping_diff').iloc[0]
+
+        scale_factor = target_ping / best_spec_row['house_ping'] if best_spec_row['house_ping'] > 0 else 1.0
+        main_ping = round(float(best_spec_row['main_ping']) * scale_factor, 1)
+        sub_ping = round(float(best_spec_row['sub_ping']) * scale_factor, 1)
+        pub_ping = round(max(0.0, target_ping - main_ping - sub_ping), 1)
+        pub_ratio = round((pub_ping / target_ping) * 100, 1) if target_ping > 0 else 32.0
+        layout = f"{best_spec_row['rooms']}房{best_spec_row['halls']}廳{best_spec_row['baths']}衛"
+
+        comm_nums = sorted(comm_all_history['p_num'].unique().tolist())
+        comm_addr_range = f"{road}{lane+'巷' if lane else ''} {comm_nums[0]}號 ~ {comm_nums[-1]}號" if len(comm_nums) > 1 else f"{road}{lane+'巷' if lane else ''}{num}號"
+        floors_display = f"{target_floor}樓 / 共 {target_total_floors} 樓" if (target_floor > 0 and target_total_floors > 0) else f"共 {target_total_floors} 樓"
+
+        latest_db_month = int(road_df['month_val'].max())
+        one_year_cutoff = latest_db_month - 12
+
+        min_ping = round(target_ping * (1 - range_ratio), 1)
+        max_ping = round(target_ping * (1 + range_ratio), 1)
+
+        comm_1yr_df = comm_all_history[comm_all_history['month_val'] >= one_year_cutoff].copy()
+        if target_floor != 1:
+            comm_1yr_df = comm_1yr_df[comm_1yr_df['floor_num'] != 1]
+        comm_1yr_df = comm_1yr_df.sort_values('month_val', ascending=False)
+
+        comm_note = f"本社區近一年內共成交 {len(comm_1yr_df)} 筆"
+        if comm_1yr_df.empty and not comm_all_history.empty:
+            comm_1yr_df = comm_all_history[comm_all_history['floor_num'] != 1].sort_values('month_val', ascending=False).head(10).copy()
+            comm_note = f"本社區近一年無交易，已調出本社區歷年成交共 {len(comm_1yr_df)} 筆"
+
+        nearby_1yr_df = road_df[
+            (~road_df['is_same_comm']) &
+            (road_df['month_val'] >= one_year_cutoff) &
+            (road_df['house_ping'] >= min_ping) &
+            (road_df['house_ping'] <= max_ping) &
+            ((road_df['age'] - target_age).abs() <= 6) &
+            (road_df['b_type'] == b_type)
+        ].copy()
+        if target_floor != 1:
+            nearby_1yr_df = nearby_1yr_df[nearby_1yr_df['floor_num'] != 1]
+        nearby_1yr_df['num_dist'] = (nearby_1yr_df['p_num'] - num).abs()
+        nearby_1yr_df = nearby_1yr_df.sort_values(['num_dist', 'month_val'], ascending=[True, False])
+
+        comps_combined = pd.concat([comm_1yr_df, nearby_1yr_df], ignore_index=True)
+        if comps_combined.empty:
+            comps_combined = road_df[road_df['month_val'] >= one_year_cutoff].sort_values('month_val', ascending=False).head(15).copy()
+
+        comm_1yr_fit_ping = comm_1yr_df[(comm_1yr_df['house_ping'] >= min_ping) & (comm_1yr_df['house_ping'] <= max_ping)]
+        if len(comm_1yr_fit_ping) >= 2:
+            stat_df = comm_1yr_fit_ping
+            val_basis = f"依【本社區同坪數 ({len(stat_df)}筆)】成交行情計算"
+        elif len(comm_1yr_df) >= 1:
+            stat_df = pd.concat([comm_1yr_df, nearby_1yr_df.head(5)], ignore_index=True)
+            val_basis = f"依【本社區 ({len(comm_1yr_df)}筆) ＋ 緊鄰同屋齡社區】行情計算"
+        else:
+            stat_df = comps_combined.head(12)
+            val_basis = f"依【同路段相近屋齡坪數 ({len(stat_df)}筆)】一年內行情計算"
+
+        q = stat_df['real_unit_price'].quantile([0.25, 0.5, 0.75]).to_dict()
+        low_u, med_u, high_u = round(q[0.25], 1), round(q[0.5], 1), round(q[0.75], 1)
+        avg_u = round(float(stat_df['real_unit_price'].mean()), 1)
+
+        comp_list = []
+        for _, r in comps_combined.head(30).iterrows():
+            d_str = str(r['date_str'])
+            f_date = f"{d_str[:-4]}/{d_str[-4:-2]}" if len(d_str) >= 5 else d_str
+            f_num = r['floor_num']
+            t_num = r['total_floors_num']
+            fl_display = f"{f_num}F / {t_num}F" if (f_num > 0 and t_num > 0) else f"{r['floor_raw']}/{r['total_floors_raw']}"
+            is_recent_1yr = bool(r['month_val'] >= one_year_cutoff)
+            comp_list.append({
+                "date": f_date,
+                "is_1yr": is_recent_1yr,
+                "addr": r['clean_addr'],
+                "b_type": r['b_type'],
+                "age": f"{r['age']}年" if r['age'] >= 0 else "-",
+                "build_ym": r['build_ym'][:5] if len(r['build_ym']) >= 5 else "-",
+                "ping": round(float(r['house_ping']), 1),
+                "main_ping": round(float(r['main_ping']), 1),
+                "total_ping": round(float(r['total_ping']), 1),
+                "floor": fl_display,
+                "unit": round(float(r['real_unit_price']), 1),
+                "total": round(float(r['total_price']), 0),
+                "park": round(float(r['parking_price']), 0),
+                "layout": f"{r['rooms']}房{r['halls']}廳",
+                "is_same": bool(r['is_same_comm'])
+            })
+
+        return {
+            "target": {
+                "addr": clean_input,
+                "comm_range": comm_addr_range,
+                "ping": target_ping,
+                "main_ping": main_ping,
+                "sub_ping": sub_ping,
+                "pub_ping": pub_ping,
+                "pub_ratio": pub_ratio,
+                "ping_options": merged_options,
+                "min_ping": min_ping, "max_ping": max_ping,
+                "age": target_age,
+                "build_ym": f"民國 {target_build_ym[:-4]}年{target_build_ym[-4:-2]}月" if len(target_build_ym) >= 5 else "未知",
+                "floors": floors_display,
+                "type": b_type,
+                "usage": usage,
+                "mgmt": mgmt,
+                "layout": layout,
+                "note": match_level,
+                "comm_note": comm_note,
+                "basis": val_basis
+            },
+            "val": {
+                "count": len(comps_combined),
+                "same_count": len(comm_1yr_df),
+                "avg_u": avg_u, "low_u": low_u, "med_u": med_u, "high_u": high_u,
+                "low_t": round(low_u * target_ping),
+                "med_t": round(med_u * target_ping),
+                "high_t": round(high_u * target_ping)
+            },
+            "comps": comp_list
+        }
+    except Exception as e:
+        return {"error": f"系統處理異常：{str(e)}"}
+
+@app.get("/", response_class=HTMLResponse)
+def web_portal():
+    return """
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>好房 AI 房屋規格調閱與同社區一年內行情系統 v5.1</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { font-family: 'PingFang TC', 'Microsoft JhengHei', sans-serif; background-color: #f1f5f9; }
+        .spin { animation: spin 1s linear infinite; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="text-slate-800">
+    <nav class="bg-slate-900 text-white shadow-lg sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="bg-blue-600 p-2 rounded-lg"><i class="fa-solid fa-building-shield text-xl text-white"></i></div>
+                <div>
+                    <span class="font-black text-lg tracking-wide">好房 AI 房屋建籍 ＆ 同社區行情系統</span>
+                    <span class="hidden md:inline-block ml-2 text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 px-2 py-0.5 rounded-full">v5.1 免本戶實價即可調出規格＋鎖定同社區一年內行情</span>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <div class="bg-gradient-to-r from-slate-900 via-blue-900 to-indigo-900 text-white py-7 px-4 shadow-inner">
+        <div class="max-w-7xl mx-auto">
+            <h1 class="text-2xl md:text-3xl font-extrabold mb-2">輸入地址 ➡️ 直接調出這間房屋規格 ➡️ 比對「同社區一年內成交行情」</h1>
+            <p class="text-blue-200 text-xs md:text-sm mb-5">即使這間房子從未買賣過，系統也能調出該棟大樓規格（主建物、公設、完工年月），並鎖定同社區近一年成交價！</p>
+
+            <div class="bg-white p-4 rounded-2xl shadow-xl text-slate-800 grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                <div class="md:col-span-5">
+                    <label class="text-xs font-bold text-slate-500 block mb-1">📍 輸入目標房屋地址 (有無成交過皆可查)</label>
+                    <input type="text" id="addr" value="台北市內湖區成功路四段180號6樓" 
+                           placeholder="例：新北市板橋區文化路一段188號10樓"
+                           class="w-full bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-blue-600">
+                </div>
+                <div class="md:col-span-2">
+                    <label class="text-xs font-bold text-slate-500 block mb-1">📐 扣車位坪數 (選填)</label>
+                    <input type="number" id="ping" placeholder="自動調閱本棟坪數" 
+                           class="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-bold focus:outline-none">
+                </div>
+                <div class="md:col-span-2">
+                    <label class="text-xs font-bold text-slate-500 block mb-1">🚗 車位價值 (萬元)</label>
+                    <input type="number" id="park" value="0" 
+                           class="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-bold focus:outline-none">
+                </div>
+                <div class="md:col-span-1">
+                    <label class="text-xs font-bold text-slate-500 block mb-1">🔍 坪數範圍</label>
+                    <select id="ratio" class="w-full bg-slate-50 border border-slate-300 rounded-xl px-2 py-2.5 text-sm font-bold focus:outline-none">
+                        <option value="0.15">±15%</option>
+                        <option value="0.25" selected>±25%</option>
+                        <option value="0.35">±3
