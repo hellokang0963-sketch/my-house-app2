@@ -1,17 +1,15 @@
-# 檔案名稱：app.py (v9.0 Jina雲端穿透代理 + 5168/591/樂屋/樂居 多通道實價爬蟲引擎)
-from fastapi import FastAPI, Query, Body
+# 檔案名稱：app.py
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
+import pandas as pd
 import requests
-import urllib3
+import zipfile
+import io
 import re
-import statistics
-from bs4 import BeautifulSoup
-from urllib.parse import quote
+from datetime import datetime
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-app = FastAPI(title="好房 AI 實價登錄雲端穿透爬蟲系統 v9.0")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,610 +18,894 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+# 全台縣市對應內政部實價登錄代碼表
+CITY_CODE_MAP = {
+    "臺北市": "a", "台北市": "a",
+    "臺中市": "b", "台中市": "b",
+    "基隆市": "c",
+    "臺南市": "d", "台南市": "d",
+    "高雄市": "e",
+    "新北市": "f",
+    "宜蘭縣": "g",
+    "桃園市": "h",
+    "嘉義市": "i",
+    "新竹縣": "j",
+    "苗栗縣": "k",
+    "南投縣": "m",
+    "彰化縣": "n",
+    "新竹市": "o",
+    "雲林縣": "p",
+    "嘉義縣": "q",
+    "屏東縣": "t",
+    "花蓮縣": "u",
+    "臺東縣": "v", "台東縣": "v",
+    "澎湖縣": "x",
+    "金門縣": "w",
+    "連江縣": "z"
 }
 
-def clean_addr(addr: str) -> str:
-    addr = addr.replace("臺", "台").replace(" ", "").strip()
-    full_to_half = str.maketrans("０１２３４５６７８９－～Ｆ", "0123456789-~F")
-    return addr.translate(full_to_half)
+# 快取記憶體：抓過的縣市存在記憶體，查詢速度0.1秒
+CITY_DATA_CACHE = {}
 
-def split_door_and_floor(addr: str):
-    """拆出『門牌基底 (到號為止)』與『目標樓層』"""
-    fl_m = re.search(r'號.*?(\d+|[一二三四五六七八九十]+)[樓層F]', addr)
-    floor_str = fl_m.group(1) + "樓" if fl_m else ""
-    base_door = re.sub(r'號.*$', '號', addr) if '號' in addr else addr
-    # 另取不含縣市的短門牌 (例如：內湖區成功路四段180號) 以命中 5168 與 591 標題
-    short_door = re.sub(r'^[台臺]北市|^新北市|^桃園市|^[台臺]中市|^[台臺]南市|^高雄市', '', base_door)
-    return base_door, short_door, floor_str
+def cn_num_to_str(cn: str) -> str:
+    """將中文數字 (如: 十二、二十三、九) 精準轉為阿拉伯數字字串"""
+    if not cn:
+        return ""
+    if cn.isdigit():
+        return cn
+    cn_map = {'零': 0, '〇': 0, '○': 0, '一': 1, '二': 2, '三': 3, '四': 4,
+              '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+    if '十' in cn:
+        parts = cn.split('十')
+        tens = cn_map.get(parts[0], 1) if parts[0] != '' else 1
+        ones = cn_map.get(parts[1], 0) if len(parts) > 1 and parts[1] != '' else 0
+        return str(tens * 10 + ones)
+    return "".join(str(cn_map.get(c, c)) for c in cn)
 
-def multi_channel_search(queries: list) -> list:
-    """
-    多通道抗封鎖爬蟲：
-    同時使用 Bing TW、Jina 雲端渲染代理 (r.jina.ai 專破海外 IP 驗證碼)、Yahoo 搜尋，
-    確保在 Render 免費主機上 100% 抓回 5168、591、樂居、信義、樂屋網的真實文字！
-    """
-    collected = []
+def parse_floor_int(fl_str: str) -> int:
+    """將『九層』、『14樓』、『十二層』轉為整數樓層"""
+    if not isinstance(fl_str, str):
+        return 0
+    fl_str = fl_str.split('，')[0].split(',')[0].strip()
+    if '地下' in fl_str or 'B' in fl_str.upper():
+        return -1
+    m = re.search(r'([0-9一二三四五六七八九十〇○]+)', fl_str)
+    if m:
+        val = cn_num_to_str(m.group(1))
+        return int(val) if val.isdigit() else 0
+    return 0
 
-    for q in queries:
-        # 通道 A：透過 Jina 雲端瀏覽器代理抓取 Google / Bing 台灣區結果 (繞過機房 IP 封鎖)
-        try:
-            jina_url = f"https://r.jina.ai/https://www.bing.com/search?q={quote(q)}&setlang=zh-Hant&cc=TW"
-            r = requests.get(jina_url, headers={"User-Agent": "Mozilla/5.0", "X-Return-Format": "text"}, timeout=10)
-            if r.status_code == 200 and len(r.text) > 100:
-                for line in r.text.splitlines():
-                    line = line.strip()
-                    if len(line) > 25 and any(k in line for k in ['萬', '坪', '樓', '號', '屋齡', '社區', '成交']):
-                        collected.append(line)
-        except Exception:
-            pass
+def normalize_address(addr: str) -> str:
+    """統一門牌格式：全形轉半形、台轉臺、重複縣市剔除、中文段樓層之幾轉阿拉伯數字"""
+    if not isinstance(addr, str):
+        return ""
+    addr = addr.replace("台", "臺").strip()
+    full_to_half = str.maketrans("０１２３４５６７８９－—～", "0123456789---")
+    addr = addr.translate(full_to_half)
+    # 剔除重複輸入的縣市或行政區 (例如：新竹市新竹市西濱路 -> 新竹市西濱路)
+    addr = re.sub(r'([臺北新桃中南高基宜竹苗彰投雲嘉屏花東澎金連]{2}[市縣])\1+', r'\1', addr)
+    # 轉換中文數字 + (段|樓|層|巷|弄|號)
+    addr = re.sub(
+        r'([一二三四五六七八九十〇○]+)(段|樓|層|巷|弄|號)',
+        lambda m: f"{cn_num_to_str(m.group(1))}{'樓' if m.group(2) == '層' else m.group(2)}",
+        addr
+    )
+    addr = re.sub(r'(\d+)層', r'\1樓', addr)
+    # 轉換「之三」->「之3」
+    addr = re.sub(
+        r'之([一二三四五六七八九十〇○]+)',
+        lambda m: f"之{cn_num_to_str(m.group(1))}",
+        addr
+    )
+    return addr
 
-        # 通道 B：Bing 台灣直連 HTML 解析
-        try:
-            b_url = f"https://www.bing.com/search?q={quote(q)}&setlang=zh-Hant&cc=TW"
-            r2 = requests.get(b_url, headers=HEADERS, timeout=7)
-            if r2.status_code == 200:
-                soup = BeautifulSoup(r2.text, "html.parser")
-                for li in soup.select("li.b_algo"):
-                    txt = li.get_text(" ", strip=True)
-                    if len(txt) > 20:
-                        collected.append(txt)
-        except Exception:
-            pass
+def parse_roc_date(date_str: str) -> int:
+    if not isinstance(date_str, str) or len(date_str) < 6:
+        return 0
+    try:
+        year = int(date_str[:-4]) + 1911
+        month = int(date_str[-4:-2])
+        return year * 12 + month
+    except:
+        return 0
 
-        # 通道 C：Yahoo 奇摩搜尋
-        try:
-            y_url = f"https://tw.search.yahoo.com/search?p={quote(q)}"
-            r3 = requests.get(y_url, headers=HEADERS, timeout=7)
-            if r3.status_code == 200:
-                soup3 = BeautifulSoup(r3.text, "html.parser")
-                for div in soup3.select("div.algo, div.dd.algo, li div.compText, div.Sr"):
-                    txt = div.get_text(" ", strip=True)
-                    if len(txt) > 20:
-                        collected.append(txt)
-        except Exception:
-            pass
+def fetch_moi_online_data(city_code: str) -> pd.DataFrame:
+    """直接從內政部伺服器抓取最新與歷史實價登錄網路資料"""
+    if city_code in CITY_DATA_CACHE:
+        return CITY_DATA_CACHE[city_code]
 
-        if len(collected) >= 12:
+    print(f"🌐 正在從內政部伺服器即時抓取 [{city_code.upper()}] 縣市之實價登錄資料...")
+    dfs = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    target_filename = f"{city_code}_lvr_land_a.csv"
+
+    # 1. 先抓內政部「最新一期」公開資料 ZIP
+    urls_to_fetch = ["https://plvr.land.moi.gov.tw/Download?type=zip&fileName=lvr_landcsv.zip"]
+
+    # 2. 自動推算並抓取過去 8 季 (約 2 年) 的資料，確保同社區與本戶房屋資料充足
+    now = datetime.now()
+    roc_year = now.year - 1911
+    for y in [roc_year, roc_year - 1, roc_year - 2]:
+        for s in [4, 3, 2, 1]:
+            urls_to_fetch.append(f"https://plvr.land.moi.gov.tw/DownloadSeason?season={y}S{s}&type=zip&fileName=lvr_landcsv.zip")
+
+    success_seasons = 0
+    for url in urls_to_fetch:
+        if success_seasons >= 6:  # 抓滿最新一期 + 近5~6季資料，兼顧速度與社區覆蓋率
             break
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+                    if target_filename in z.namelist():
+                        with z.open(target_filename) as f:
+                            sub_df = pd.read_csv(f, dtype=str, on_bad_lines='skip')
+                            if len(sub_df) > 1:
+                                dfs.append(sub_df.iloc[1:])  # 跳過第二行英文標頭
+                                success_seasons += 1
+        except Exception:
+            continue
 
-    # 去重並保留順序
-    unique_list = []
-    seen = set()
-    for item in collected:
-        short_k = item[:60]
-        if short_k not in seen:
-            seen.add(short_k)
-            unique_list.append(item)
-    return unique_list
+    if not dfs:
+        return pd.DataFrame()
 
-def parse_real_estate_texts(texts: list, full_addr: str, base_door: str, short_door: str, target_floor: str, custom_ping: float = 0):
-    combined = " \n ".join(texts)
+    df = pd.concat(dfs, ignore_index=True)
 
-    # 1. 抓取【社區名稱】(支援 591【双湖滙】、信義「雙湖匯」、樂屋網、5168 格式)
-    comm_name = ""
-    comm_patterns = [
-        r'【([^】]{2,12}?)】',
-        r'「([^」]{2,12}?)」',
-        r'([^\s\-｜|：:，,。/]{2,10}?)\s*[/｜|\-]\s*近[三一]個月平均單價',
-        r'([\u4e00-\u9fa5]{2,8}?(?:滙|匯|花園|社區|大廈|華廈|廣場|世紀|天下|帝國|名邸|山莊|新城|國宅|學苑|御苑|麗緻|公爵|一品|世家|傳奇|之星|時代|捷市|高第|晶鑽|凱旋|星鑽|皇家|尊爵|城堡|立方|新象))'
-    ]
-    bad_names = {'實價登錄', '最新實價', '成交行情', '最新成交', '內政部', '信義房屋', '永慶房產', '好房網', '樂屋網', '比價王', '歷史實價', '台北市', '新北市', '桃園市', '台中市', '台南市', '高雄市', base_door[-6:], short_door[:5]}
-    for pat in comm_patterns:
-        for m in re.findall(pat, combined):
-            m_c = m.strip()
-            if 2 <= len(m_c) <= 10 and not any(b in m_c for b in bad_names) and not re.search(r'\d+號|\d+樓|路|街|段', m_c):
-                comm_name = m_c
-                break
-        if comm_name:
-            break
+    # 清洗網路抓下來的原始資料
+    df['clean_addr'] = df['土地位置建物門牌'].astype(str).apply(normalize_address)
+    df['total_ping'] = pd.to_numeric(df['建物移轉總面積平方公尺'], errors='coerce').fillna(0) * 0.3025
+    df['parking_ping'] = pd.to_numeric(df['車位移轉總面積(平方公尺)'], errors='coerce').fillna(0) * 0.3025
+    df['house_ping'] = (df['total_ping'] - df['parking_ping']).clip(lower=0)
 
-    # 2. 抓取【真實屋齡】与【總樓層】
-    ages = [int(x) for x in re.findall(r'(?:屋齡|當時屋齡)\s*[:：約]*\s*(\d{1,2})(?:\.\d+)?\s*年', combined) if 1 <= int(x) <= 65]
-    if not ages:
-        ages = [int(x) for x in re.findall(r'(\d{1,2})(?:\.\d+)?\s*年\s*[;；｜|/\s]\s*\d+\s*(?:/|樓)', combined) if 1 <= int(x) <= 65]
-    real_age = max(ages) if ages else None
+    # 主建物、附屬建物、陽台面積 (平方公尺轉坪)
+    df['main_ping'] = pd.to_numeric(df.get('主建物面積', 0), errors='coerce').fillna(0) * 0.3025
+    df['sub_ping'] = pd.to_numeric(df.get('附屬建物面積', 0), errors='coerce').fillna(0) * 0.3025
+    df['balcony_ping'] = pd.to_numeric(df.get('陽台面積', 0), errors='coerce').fillna(0) * 0.3025
 
-    total_fls = [int(x) for x in re.findall(r'(?:\d+\s*/\s*|樓高\s*|共\s*)(\d{1,2})\s*[樓層F]', combined) if 3 <= int(x) <= 50]
-    real_total_floors = statistics.mode(total_fls) if total_fls else None
+    df['total_price'] = pd.to_numeric(df['總價元'], errors='coerce').fillna(0) / 10000
+    df['parking_price'] = pd.to_numeric(df['車位總價元'], errors='coerce').fillna(0) / 10000
 
-    # 3. 抓取本戶詳細面積（如 5168 比價王格式：建物1筆93.58坪 室內使用 51.58 共有部分 24.4 坡道平面 17.61）
-    indoor_m = re.search(r'(?:室內使用|主建物)\s*(\d{1,3}(?:\.\d{1,2})?)', combined)
-    pub_m = re.search(r'(?:共有部分|公設)\s*(\d{1,3}(?:\.\d{1,2})?)', combined)
-    layout_m = re.search(r'(\d\s*房(?:\(室\))?\s*\d\s*廳\s*\d\s*衛)', combined)
+    def calc_unit(row):
+        if row['house_ping'] <= 1:
+            return 0
+        if row['parking_price'] > 0 and row['parking_ping'] > 0:
+            return (row['total_price'] - row['parking_price']) / row['house_ping']
+        return row['total_price'] / row['total_ping'] if row['total_ping'] > 0 else 0
 
-    indoor_ping = float(indoor_m.group(1)) if indoor_m else None
-    pub_ping = float(pub_m.group(1)) if pub_m else None
-    layout_str = layout_m.group(1).replace("(室)", "") if layout_m else "3房2廳2衛"
+    df['real_unit_price'] = df.apply(calc_unit, axis=1)
+    df['month_val'] = df['交易年月日'].apply(parse_roc_date)
+    df['floor_num'] = df['移轉層次'].apply(parse_floor_int)
+    df['total_floor_num'] = df['總樓層數'].apply(parse_floor_int)
 
-    # 4. 萃取所有坪數與單價
-    pings_found = []
-    for m in re.finditer(r'(\d{2,3}(?:\.\d{1,2})?)\s*(?:建坪|坪)', combined):
-        val = float(m.group(1))
-        if 10.0 <= val <= 160.0:
-            pings_found.append(round(val, 1))
+    # 過濾掉特殊交易與純車位/純土地交易
+    df = df[df['交易標的'].str.contains('房地', na=False)]
+    df = df[~df['備註'].astype(str).str.contains('親友|特殊|急買|急賣|瑕疵|增建|政府|債權', na=False)]
+    df = df[(df['real_unit_price'] > 5) & (df['real_unit_price'] < 400)]
+    df = df.drop_duplicates(subset=['clean_addr', '交易年月日', '總價元'])
 
-    unit_prices = []
-    for m in re.finditer(r'(\d{2,3}(?:\.\d{1,2})?)\s*萬\s*/\s*坪', combined):
-        val = float(m.group(1))
-        if 10.0 <= val <= 300.0:
-            unit_prices.append(round(val, 1))
+    CITY_DATA_CACHE[city_code] = df
+    print(f"✅ [{city_code.upper()}] 網路資料抓取完成，共 {len(df)} 筆真實交易！")
+    return df
 
-    # 5. 解析各筆成交明細
-    records = []
-    seen_u = set()
-    for txt in texts:
-        # 找尋段落中的所有單價
-        for um in re.finditer(r'(\d{2,3}(?:\.\d{1,2})?)\s*萬\s*/\s*坪', txt):
-            u_val = round(float(um.group(1)), 1)
-            if u_val < 10 or u_val > 300 or u_val in seen_u:
-                continue
-            seen_u.add(u_val)
-
-            # 取單價前後 90 字元找對應的總價、坪數、樓層、日期、門牌
-            start_pos = max(0, um.start() - 90)
-            end_pos = min(len(txt), um.end() + 90)
-            sub_txt = txt[start_pos:end_pos]
-
-            pm = re.search(r'(\d{2,3}(?:\.\d{1,2})?)\s*(?:建坪|坪)', sub_txt)
-            tm = re.search(r'(\d{1,2},?\d{3,4})\s*萬', sub_txt)
-            dm = re.search(r'(1\d{2}\s*[年/\-\.]\s*\d{1,2}|202\d\s*[年/\-\.]\s*\d{1,2})', sub_txt)
-            flm = re.search(r'(\d{1,2}\s*[樓F層](?:之\d+)?)', sub_txt)
-            addrm = re.search(r'([^\s，,。｜|：:；;]{3,14}?\d+號(?:\s*\|?\s*\d+[樓F層](?:之\d+)?)?)', sub_txt)
-
-            p_val = round(float(pm.group(1)), 1) if pm and 10 <= float(pm.group(1)) <= 160 else (round(indoor_ping + pub_ping, 1) if (indoor_ping and pub_ping) else 45.0)
-            t_val = int(tm.group(1).replace(',', '')) if tm and int(tm.group(1).replace(',', '')) > 300 else round(u_val * p_val)
-            d_val = dm.group(1).replace("年", "/").replace("-", "/").replace(" ", "") if dm else "近期實價"
-            f_val = flm.group(1) if flm else (target_floor or "標準層")
-            a_val = addrm.group(1) if addrm else (f"{comm_name} ({short_door})" if comm_name else short_door)
-
-            records.append({
-                "date": d_val,
-                "addr": a_val,
-                "ping": p_val,
-                "floor": f_val,
-                "unit": u_val,
-                "total": t_val,
-                "raw_snippet": sub_txt.strip()
-            })
-
-    return {
-        "comm_name": comm_name,
-        "real_age": real_age,
-        "real_total_floors": real_total_floors,
-        "indoor_ping": indoor_ping,
-        "pub_ping": pub_ping,
-        "layout_str": layout_str,
-        "pings_found": sorted(list(set(pings_found)))[:6],
-        "unit_prices": unit_prices,
-        "records": records
-    }
 
 @app.get("/api/analyze")
-def analyze(address: str = Query(...), custom_ping: float = Query(0)):
-    clean_in = clean_addr(address)
-    base_door, short_door, target_floor = split_door_and_floor(clean_in)
+def analyze(
+    address: str = Query(...),
+    custom_ping: float = Query(0),
+    custom_park_price: float = Query(-1),
+    ping_tol: float = Query(0.15)  # 預設坪數接近範圍 ±15%
+):
+    clean_input = normalize_address(address)
 
-    # 組合精準搜尋關鍵字 (同時鎖定 本戶樓層、本棟門牌、5168比價王、591實價、樂屋網、信義房屋)
-    queries = [
-        f'"{short_door}{target_floor}" 實價登錄 坪 萬',
-        f'"{short_door}" 實價登錄 OR 社區 OR 樂居 OR 591 萬/坪',
-        f'{clean_in} 實價登錄 坪 萬/坪'
-    ]
-    texts = multi_channel_search(queries)
-    parsed = parse_real_estate_texts(texts, clean_in, base_door, short_door, target_floor, custom_ping)
+    # 1. 自動判斷縣市
+    city_code = "o" if "新竹市" in clean_input else "a"
+    for city_name, code in CITY_CODE_MAP.items():
+        if city_name in clean_input:
+            city_code = code
+            break
 
-    # 如果抓到了社區名稱 (如 双湖滙)，再補抓一次該社區名稱在 591/樂居 的最新一年成交！
-    if parsed['comm_name']:
-        comm_q = [f'"{parsed["comm_name"]}" 實價登錄 115 OR 114 萬/坪']
-        more_texts = multi_channel_search(comm_q)
-        if more_texts:
-            texts = texts + more_texts
-            parsed = parse_real_estate_texts(texts, clean_in, base_door, short_door, target_floor, custom_ping)
+    df = fetch_moi_online_data(city_code)
+    if df.empty:
+        return {"error": "目前內政部開放資料伺服器連線逾時，請稍後再試。"}
 
-    leju_url = f"https://www.leju.com.tw/page_search_result?area_search={quote(base_door)}"
-    houseprice_url = f"https://www.google.com/search?q={quote(clean_in + ' 實價登錄')}"
+    # 2. 解析使用者輸入的門牌：行政區 + 路街段 + 巷 + 弄 + 號 + 樓 + 之幾
+    pattern = r'([臺北新桃中南高基宜竹苗彰投雲嘉屏花東澎金連]{2}[市縣])?(.+?[區鄉鎮市])?(.+?[路街段大道])(\d+巷)?(\d+弄)?(\d+(?:之\d+)?號)(\d+樓)?(之\d+)?'
+    match = re.search(pattern, clean_input)
+    if not match:
+        return {"error": "請輸入包含『縣市、路街、號』的完整地址，例如：新竹市西濱路一段185號9樓之3"}
 
-    if not parsed['unit_prices'] and not parsed['records']:
-        return JSONResponse({
-            "error": f"雲端搜尋尚未能直接讀取『{address}』的文字單價。您可以點擊下方按鈕打開實價網頁，並將網頁文字貼到下方【手動貼上文字解析器】立即算出落點！",
-            "leju_url": leju_url,
-            "houseprice_url": houseprice_url
+    district = match.group(2) or ""
+    road = match.group(3) or ""
+    lane = match.group(4) or ""
+    alley = match.group(5) or ""
+    number = match.group(6) or ""       # 例：185號
+    floor_str = match.group(7) or ""    # 例：9樓
+    sub_unit = match.group(8) or ""     # 例：之3
+
+    input_floor_num = int(re.sub(r'\D', '', floor_str)) if floor_str else 0
+    num_val = int(re.sub(r'\D', '', number.split('之')[0]))
+
+    # 建立門牌比對正則
+    base_doorplate = f"{road}{lane}{alley}{number}"
+    # 同側連號門牌 (例如 185號 -> 181, 183, 185, 187, 189號)
+    same_side_nums = "|".join([f"{n}號" for n in range(max(1, num_val - 6), num_val + 7, 2)])
+    nearby_doorplate_regex = f"{re.escape(road + lane + alley)}({same_side_nums})"
+
+    # =========================================================================
+    # 功能 1：帶出「我這間房屋資料」 (四層精準匹配：同戶 -> 同棟同之幾標準層 -> 同門牌 -> 同社區)
+    # =========================================================================
+    exact_door_df = df[df['clean_addr'].str.contains(
+        f"{re.escape(base_doorplate)}(?![0-9])", na=False
+    )].sort_values(by='month_val', ascending=False)
+
+    unit_match_df = pd.DataFrame()
+    match_level = ""
+
+    # Level 1: 完全同戶 (同號 + 同樓 + 同之幾)
+    if not exact_door_df.empty and (floor_str or sub_unit):
+        cond = pd.Series(True, index=exact_door_df.index)
+        if input_floor_num > 0:
+            cond &= (exact_door_df['floor_num'] == input_floor_num)
+        if sub_unit:
+            cond &= exact_door_df['clean_addr'].str.contains(re.escape(sub_unit), na=False)
+        if cond.any():
+            unit_match_df = exact_door_df[cond]
+            match_level = f"🎯 精準命中本戶歷史實價資料（{base_doorplate}{floor_str}{sub_unit}）"
+
+    # Level 2: 同棟同柱標準層 (同號 + 相同「之幾」，台灣大樓同柱垂直樓層格局與坪數完全相同)
+    if unit_match_df.empty and not exact_door_df.empty and sub_unit:
+        cond = exact_door_df['clean_addr'].str.contains(re.escape(sub_unit), na=False)
+        if cond.any():
+            unit_match_df = exact_door_df[cond]
+            match_level = f"✅ 自動帶出同棟同戶別標準層規格（{base_doorplate}*{sub_unit}，垂直同柱格局坪數一致）"
+
+    # Level 3: 同門牌大樓 (同號)
+    if unit_match_df.empty and not exact_door_df.empty:
+        unit_match_df = exact_door_df
+        match_level = f"✅ 自動帶出同棟門牌規格（{base_doorplate}）"
+
+    # Level 4: 緊鄰連號同社區門牌
+    nearby_df = df[df['clean_addr'].str.contains(nearby_doorplate_regex, na=False)].sort_values(by='month_val', ascending=False)
+    if unit_match_df.empty and not nearby_df.empty:
+        if sub_unit and nearby_df['clean_addr'].str.contains(re.escape(sub_unit), na=False).any():
+            unit_match_df = nearby_df[nearby_df['clean_addr'].str.contains(re.escape(sub_unit), na=False)]
+            match_level = f"✅ 自動帶出同社區同戶別（{sub_unit}）標準規格"
+        else:
+            unit_match_df = nearby_df
+            match_level = f"ℹ️ 自動帶出同社區鄰近門牌（{road}{number}周邊）標準規格"
+
+    # Level 5: 同路段備援
+    road_df = df[df['clean_addr'].str.contains(re.escape(road), na=False)].sort_values(by='month_val', ascending=False)
+    if unit_match_df.empty:
+        if road_df.empty:
+            return {"error": f"內政部近期資料查無『{road}』的交易，請確認縣市與路名是否正確。"}
+        unit_match_df = road_df
+        match_level = f"ℹ️ 該門牌近期無交易，已帶入『{road}』同路段代表規格（可於上方微調坪數）"
+
+    # 取出最具代表性的本戶房屋資料列
+    ref_row = unit_match_df.iloc[0]
+    current_roc_year = datetime.now().year - 1911
+    build_ym = str(ref_row.get('建築完成年月', '')).strip()
+    build_y = int(build_ym[:-4]) if len(build_ym) >= 5 and build_ym[:-4].isdigit() else (current_roc_year - 15)
+    target_age = max(1, current_roc_year - build_y)
+    build_ym_fmt = f"民國{build_ym[:-4]}年{build_ym[-4:-2]}月" if len(build_ym) >= 5 else "未揭露"
+
+    # 計算本戶各項坪數
+    target_house_ping = round(float(unit_match_df['house_ping'].median()), 2) if custom_ping <= 0 else round(float(custom_ping), 2)
+    target_main_ping = round(float(unit_match_df['main_ping'].median()), 2)
+    target_sub_ping = round(float((unit_match_df['sub_ping'] + unit_match_df['balcony_ping']).median()), 2)
+    target_park_ping = round(float(unit_match_df['parking_ping'].median()), 2)
+    target_total_ping = round(target_house_ping + target_park_ping, 2)
+
+    # 車位參考價自動推算 (若有車位則抓同社區車位中位數價)
+    park_rows = unit_match_df[unit_match_df['parking_price'] > 0]
+    if park_rows.empty and not nearby_df.empty:
+        park_rows = nearby_df[nearby_df['parking_price'] > 0]
+    auto_park_price = round(float(park_rows['parking_price'].median()), 0) if not park_rows.empty and target_park_ping > 0 else 0
+    final_park_price = auto_park_price if custom_park_price < 0 else custom_park_price
+
+    # 格局、樓層、建材、車位型態
+    rooms = str(ref_row.get('建物現況格局-房', '0'))
+    halls = str(ref_row.get('建物現況格局-廳', '0'))
+    baths = str(ref_row.get('建物現況格局-衛', '0'))
+    layout_str = f"{rooms}房{halls}廳{baths}衛" if rooms.isdigit() and int(rooms) > 0 else "開放式/未揭露"
+    total_floors_str = str(ref_row.get('總樓層數', '')).replace('層', '樓')
+    total_floor_int = int(ref_row.get('total_floor_num', 0))
+    display_floor = f"{input_floor_num}樓" if input_floor_num > 0 else str(ref_row.get('移轉層次', '')).replace('層', '樓')
+    b_type = str(ref_row.get('建物型態', '')).split('(')[0]
+    material = str(ref_row.get('主要建材', '鋼筋混凝土造'))
+    manage_org = "有管委會" if str(ref_row.get('有無管理組織', '')) == '有' else "無管委會"
+    elevator = "有電梯" if str(ref_row.get('電梯', '有')) == '有' or '大樓' in b_type or '華廈' in b_type else "無電梯"
+    park_type = str(ref_row.get('車位類別', '')).strip()
+    if not park_type or park_type == 'nan':
+        park_type = "坡道平面" if target_park_ping > 0 else "無車位/未拆分"
+
+    # 整理本戶/同柱歷史成交紀錄 (最多列3筆供房仲開發參考)
+    unit_history = []
+    for _, hr in unit_match_df.head(3).iterrows():
+        d_s = str(hr['交易年月日'])
+        unit_history.append({
+            "date": f"{d_s[:-4]}/{d_s[-4:-2]}" if len(d_s) >= 5 else d_s,
+            "addr": hr['clean_addr'],
+            "total_ping": round(float(hr['total_ping']), 2),
+            "house_ping": round(float(hr['house_ping']), 2),
+            "total_price": round(float(hr['total_price']), 0),
+            "unit_price": round(float(hr['real_unit_price']), 1)
         })
 
-    # 決定這間房子的目標計算坪數 (優先順序：手動指定 > 室內+公設真實坪數 > 網路抓取坪數中位數)
-    if custom_ping > 0:
-        target_ping = custom_ping
-    elif parsed['indoor_ping'] and parsed['pub_ping']:
-        target_ping = round(parsed['indoor_ping'] + parsed['pub_ping'], 1)
-    elif parsed['pings_found']:
-        target_ping = round(statistics.median(parsed['pings_found']), 1)
+    # =========================================================================
+    # 功能 2：比對「同社區 ＋ 坪數接近」的實價登錄
+    # =========================================================================
+    # 智慧識別同社區：同條路 + (相同建築完成年月前5碼 或 緊鄰連號且同總樓層數)
+    build_prefix = build_ym[:5] if len(build_ym) >= 5 else ""
+    if build_prefix:
+        same_comm_mask = (
+            df['clean_addr'].str.contains(re.escape(road), na=False) &
+            (
+                (df['建築完成年月'].astype(str).str[:5] == build_prefix) |
+                df['clean_addr'].str.contains(nearby_doorplate_regex, na=False)
+            )
+        )
     else:
-        target_ping = 35.0
+        same_comm_mask = df['clean_addr'].str.contains(nearby_doorplate_regex, na=False)
 
-    u_list = sorted(parsed['unit_prices'])
-    if len(u_list) >= 3:
-        low_u = round(u_list[int(len(u_list) * 0.25)], 1)
-        med_u = round(statistics.median(u_list), 1)
-        high_u = round(u_list[int(len(u_list) * 0.75)], 1)
-        avg_u = round(statistics.mean(u_list), 1)
+    df['is_same_comm'] = same_comm_mask
+    df['is_same_sub'] = df['clean_addr'].str.contains(re.escape(sub_unit), na=False) if sub_unit else False
+    df['ping_diff'] = (df['house_ping'] - target_house_ping).abs()
+
+    max_m = df['month_val'].max()
+    # 坪數接近區間：依使用者設定之百分比 (預設 ±15%) 或至少 ±4.5 坪容許值
+    min_p = min(target_house_ping * (1 - ping_tol), target_house_ping - 4.5)
+    max_p = max(target_house_ping * (1 + ping_tol), target_house_ping + 4.5)
+
+    # 優先篩選：同社區 + 坪數接近 + 近一年半內
+    comm_close_comps = df[
+        df['is_same_comm'] &
+        (df['house_ping'] >= min_p) &
+        (df['house_ping'] <= max_p) &
+        (df['month_val'] >= max_m - 18)
+    ].copy()
+
+    # 若近一年半同社區相似坪數不足 3 筆，放寬至同社區全期程相似坪數
+    if len(comm_close_comps) < 3:
+        comm_close_comps = df[
+            df['is_same_comm'] &
+            (df['house_ping'] >= min_p) &
+            (df['house_ping'] <= max_p)
+        ].copy()
+
+    # 若同社區相似坪數仍不足 3 筆，才加入同路段同屋齡段(±5年)相似坪數作為輔助參考
+    if len(comm_close_comps) >= 3:
+        comps = comm_close_comps
+        comp_scope_note = f"✅ 100% 採用【同社區】且坪數接近（{round(min_p,1)}~{round(max_p,1)}坪）之實價登錄進行估價"
     else:
-        med_u = round(u_list[0], 1)
-        low_u = round(med_u * 0.94, 1)
-        high_u = round(med_u * 1.06, 1)
-        avg_u = med_u
+        road_close_comps = df[
+            df['clean_addr'].str.contains(re.escape(road), na=False) &
+            (df['house_ping'] >= min_p) &
+            (df['house_ping'] <= max_p) &
+            (df['month_val'] >= max_m - 15)
+        ].copy()
+        comps = pd.concat([comm_close_comps, road_close_comps]).drop_duplicates(subset=['clean_addr', '交易年月日', '總價元'])
+        comp_scope_note = f"ℹ️ 同社區相似坪數共 {len(comm_close_comps)} 筆，已自動納入同路段相似坪數共 {len(comps)} 筆協同估價"
 
-    area_detail = f"主建+陽台 {parsed['indoor_ping']}坪 ＋ 公設 {parsed['pub_ping']}坪" if (parsed['indoor_ping'] and parsed['pub_ping']) else "依權狀面積為準 (已排除車位坪數)"
-    comm_title = f"【{parsed['comm_name']}】" if parsed['comm_name'] else f"【{short_door} 社區】"
-    fl_str = f"{target_floor} / 共 {parsed['real_total_floors']} 樓" if (target_floor and parsed['real_total_floors']) else (f"共 {parsed['real_total_floors']} 樓" if parsed['real_total_floors'] else (target_floor or "標準層"))
+    if comps.empty:
+        return {"error": f"查無該社區周邊坪數接近 {target_house_ping} 坪之交易，請嘗試調整坪數或放寬坪數範圍。"}
 
-    return JSONResponse({
+    # 排序：同社區優先 > 同戶別(之幾)優先 > 交易時間最新 > 坪數最接近
+    comps = comps.sort_values(
+        by=['is_same_comm', 'is_same_sub', 'month_val', 'ping_diff'],
+        ascending=[False, False, False, True]
+    )
+
+    # =========================================================================
+    # 功能 3：房仲實戰估價 — 建議售價、建議開價、建議底價(含服務費)
+    # =========================================================================
+    # 計算基礎優先以「同社區相似坪數」為主，避免被外圍低價公寓拉低
+    val_source_df = comm_close_comps if len(comm_close_comps) >= 2 else comps
+    q = val_source_df['real_unit_price'].quantile([0.25, 0.5, 0.75]).to_dict()
+    low_u, med_u, high_u = round(q[0.25], 1), round(q[0.5], 1), round(q[0.75], 1)
+
+    # 樓層高低微調係數 (若使用者有輸入樓層：中高樓層微調 +1.5%，低樓層 2~3樓 -1.5%)
+    floor_factor = 1.0
+    floor_adj_note = "標準樓層係數 (1.00)"
+    if input_floor_num > 0 and total_floor_int > 4:
+        ratio = input_floor_num / total_floor_int
+        if input_floor_num == 4:
+            floor_factor = 0.98
+            floor_adj_note = "4樓諧音微調 (-2%)"
+        elif ratio >= 0.75 and input_floor_num < total_floor_int:
+            floor_factor = 1.02
+            floor_adj_note = "中高樓層景觀加分 (+2%)"
+        elif input_floor_num == total_floor_int:
+            floor_factor = 0.99
+            floor_adj_note = "頂樓係數微調 (-1%)"
+        elif input_floor_num <= 3:
+            floor_factor = 0.985
+            floor_adj_note = "低樓層係數微調 (-1.5%)"
+
+    # 1. 建議售價 (合理市場成交價) = 調整後單價 × 本戶扣車位建坪 + 車位價格
+    suggested_unit = round(med_u * floor_factor, 1)
+    suggested_sale_price = round(suggested_unit * target_house_ping + final_park_price)
+
+    # 2. 建議開價 (預留 10% 買方議價空間，前端可動態調整)
+    asking_price = round(suggested_sale_price * 1.10)
+    asking_unit = round((asking_price - final_park_price) / target_house_ping, 1) if target_house_ping > 0 else 0
+
+    # 3. 建議底價 (含 4% 賣方服務費) 與 屋主實拿金額
+    # 底價(含服務費) 設定為合理成交價之 97% (或貼近 PR35 區間)，確保具備成交競爭力且內含仲介費
+    bottom_price_incl_fee = round(suggested_sale_price * 0.97)
+    default_fee_rate = 0.04  # 預設賣方 4% 服務費
+    service_fee_amt = round(bottom_price_incl_fee * default_fee_rate, 1)
+    seller_net_proceeds = round(bottom_price_incl_fee - service_fee_amt, 1)
+
+    # 整理實價登錄比對清單 (最多15筆)
+    comp_list = []
+    for _, r in comps.head(15).iterrows():
+        d_str = str(r['交易年月日'])
+        f_date = f"{d_str[:-4]}/{d_str[-4:-2]}" if len(d_str) >= 5 else d_str
+        p_diff = round(float(r['house_ping']) - target_house_ping, 1)
+        p_diff_str = f"+{p_diff}坪" if p_diff > 0 else (f"{p_diff}坪" if p_diff < 0 else "坪數相同")
+        comp_list.append({
+            "date": f_date,
+            "addr": r['clean_addr'],
+            "total_ping": round(float(r['total_ping']), 1),
+            "house_ping": round(float(r['house_ping']), 1),
+            "ping_diff": p_diff_str,
+            "floor": f"{str(r['移轉層次']).replace('層','樓')}/{str(r['總樓層數']).replace('層','樓')}",
+            "layout": f"{r.get('建物現況格局-房','0')}房{r.get('建物現況格局-廳','0')}廳{r.get('建物現況格局-衛','0')}衛",
+            "unit": round(float(r['real_unit_price']), 1),
+            "total": round(float(r['total_price']), 0),
+            "park": round(float(r['parking_price']), 0),
+            "is_same_comm": bool(r['is_same_comm']),
+            "is_same_sub": bool(r['is_same_sub'])
+        })
+
+    return {
         "target": {
-            "addr": clean_in,
-            "comm_name": comm_title,
-            "ping": target_ping,
-            "area_detail": area_detail,
-            "ping_options": parsed['pings_found'] if parsed['pings_found'] else [target_ping],
-            "age": f"{parsed['real_age']} 年" if parsed['real_age'] else "詳見實價明細",
-            "floors": fl_str,
-            "layout": parsed['layout_str'],
-            "leju_url": leju_url,
-            "houseprice_url": houseprice_url,
-            "raw_snippets": texts[:12]
+            "addr": clean_input,
+            "match_level": match_level,
+            "total_ping": target_total_ping,
+            "house_ping": target_house_ping,
+            "main_ping": target_main_ping,
+            "sub_ping": target_sub_ping,
+            "park_ping": target_park_ping,
+            "park_type": park_type,
+            "park_price": final_park_price,
+            "layout": layout_str,
+            "age": target_age,
+            "build_ym": build_ym_fmt,
+            "floor": display_floor,
+            "total_floors": total_floors_str,
+            "type": b_type,
+            "material": material,
+            "manage_org": manage_org,
+            "elevator": elevator,
+            "history": unit_history
         },
         "val": {
-            "count": len(parsed['records']),
-            "avg_u": avg_u,
+            "scope_note": comp_scope_note,
+            "total_count": len(comps),
+            "comm_count": len(comm_close_comps),
+            "floor_adj_note": floor_adj_note,
             "low_u": low_u,
             "med_u": med_u,
             "high_u": high_u,
-            "low_t": round(low_u * target_ping),
-            "med_t": round(med_u * target_ping),
-            "high_t": round(high_u * target_ping)
+            "suggested_unit": suggested_unit,
+            "suggested_sale": suggested_sale_price,
+            "asking_price": asking_price,
+            "asking_unit": asking_unit,
+            "bottom_incl_fee": bottom_price_incl_fee,
+            "service_fee": service_fee_amt,
+            "seller_net": seller_net_proceeds
         },
-        "comps": parsed['records']
-    })
+        "comps": comp_list
+    }
 
-@app.post("/api/parse_pasted")
-def parse_pasted_text(payload: dict = Body(...)):
-    """保底神器：讓使用者直接從樂居/591複製文字貼上，1秒自動拆算落點！"""
-    raw_text = payload.get("text", "")
-    addr = payload.get("address", "目標房屋")
-    custom_ping = float(payload.get("ping", 0) or 0)
-    clean_in = clean_addr(addr)
-    base_door, short_door, target_floor = split_door_and_floor(clean_in)
-
-    lines = [line.strip() for line in raw_text.splitlines() if len(line.strip()) > 5]
-    merged_chunks = [" ".join(lines[i:i+6]) for i in range(0, len(lines), 3)]
-    parsed = parse_real_estate_texts(merged_chunks + [raw_text], clean_in, base_door, short_door, target_floor, custom_ping)
-
-    if not parsed['unit_prices']:
-        return JSONResponse({"error": "貼上的文字中未發現『XX萬/坪』格式之單價，請確認複製的內容包含實價登錄列表！"})
-
-    target_ping = custom_ping if custom_ping > 0 else (round(statistics.median(parsed['pings_found']), 1) if parsed['pings_found'] else 35.0)
-    u_list = sorted(parsed['unit_prices'])
-    med_u = round(statistics.median(u_list), 1)
-    low_u = round(u_list[int(len(u_list) * 0.25)], 1) if len(u_list) >= 3 else round(med_u * 0.95, 1)
-    high_u = round(u_list[int(len(u_list) * 0.75)], 1) if len(u_list) >= 3 else round(med_u * 1.05, 1)
-    avg_u = round(statistics.mean(u_list), 1)
-
-    return JSONResponse({
-        "target": {
-            "addr": clean_in,
-            "comm_name": f"【{parsed['comm_name']}】" if parsed['comm_name'] else "【手動貼上之社區實價】",
-            "ping": target_ping,
-            "area_detail": "由您貼上之樂居/591實價文字解析",
-            "ping_options": parsed['pings_found'] if parsed['pings_found'] else [target_ping],
-            "age": f"{parsed['real_age']} 年" if parsed['real_age'] else "-",
-            "floors": target_floor or "-",
-            "layout": parsed['layout_str'],
-            "leju_url": f"https://www.leju.com.tw/page_search_result?area_search={quote(base_door)}",
-            "houseprice_url": f"https://www.google.com/search?q={quote(clean_in + ' 實價登錄')}",
-            "raw_snippets": merged_chunks[:10]
-        },
-        "val": {
-            "count": len(parsed['records']),
-            "avg_u": avg_u, "low_u": low_u, "med_u": med_u, "high_u": high_u,
-            "low_t": round(low_u * target_ping),
-            "med_t": round(med_u * target_ping),
-            "high_t": round(high_u * target_ping)
-        },
-        "comps": parsed['records']
-    })
 
 @app.get("/", response_class=HTMLResponse)
-def web_portal():
+def home():
     return """
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>好房 AI ✕ 樂居/591/5168 雲端穿透實價系統 v9.0</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>房仲實戰估價系統｜同社區實價比對＆委託底價試算</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body { font-family: 'PingFang TC', 'Microsoft JhengHei', sans-serif; background-color: #f1f5f9; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #0f172a; }
+        .app-box { max-width: 540px; margin: 0 auto; min-height: 100vh; background-color: #f1f5f9; padding-bottom: 48px; }
         .spin { animation: spin 1s linear infinite; }
         @keyframes spin { 100% { transform: rotate(360deg); } }
     </style>
 </head>
-<body class="text-slate-800">
-    <nav class="bg-slate-900 text-white shadow-lg sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-            <div class="flex items-center space-x-3">
-                <div class="bg-amber-500 p-2 rounded-lg"><i class="fa-solid fa-bolt-lightning text-xl text-slate-950"></i></div>
+<body>
+<div class="app-box shadow-2xl">
+    <!-- 頂部搜尋列 -->
+    <div class="bg-gradient-to-br from-slate-900 via-blue-900 to-indigo-900 text-white p-5 rounded-b-3xl shadow-lg">
+        <div class="flex items-center justify-between mb-1.5">
+            <h1 class="text-lg font-extrabold tracking-tight">
+                <i class="fa-solid fa-building-circle-check text-amber-400 mr-1.5"></i>房仲社區實價＆委託估價系統
+            </h1>
+            <span class="text-[10px] bg-emerald-500 text-white px-2.5 py-0.5 rounded-full font-bold shadow">內政部即時連線</span>
+        </div>
+        <p class="text-blue-200 text-xs mb-4">輸入門牌自動帶出本戶產權規格、鎖定同社區相近坪數實價，並計算建議售價、開價與含服務費底價。</p>
+
+        <div class="bg-white p-4 rounded-2xl text-gray-800 shadow-xl space-y-3">
+            <div>
+                <label class="text-[11px] font-bold text-slate-500">📍 輸入完整門牌地址（含樓層/之幾）：</label>
+                <input type="text" id="addr" value="新竹市西濱路一段185號9樓之3"
+                       placeholder="例：新竹市西濱路一段185號9樓之3"
+                       class="w-full text-sm font-extrabold text-slate-900 border-b-2 border-blue-200 py-1.5 focus:outline-none focus:border-blue-600">
+            </div>
+
+            <div class="grid grid-cols-3 gap-2">
+                <div class="bg-slate-50 p-2 rounded-xl border border-slate-200">
+                    <label class="text-[10px] text-gray-500 font-semibold block">扣車位建坪 (選填)</label>
+                    <input type="number" step="0.1" id="ping" placeholder="自動抓取本戶" class="w-full text-xs font-bold text-blue-700 bg-transparent focus:outline-none mt-0.5">
+                </div>
+                <div class="bg-slate-50 p-2 rounded-xl border border-slate-200">
+                    <label class="text-[10px] text-gray-500 font-semibold block">車位價值 (萬元)</label>
+                    <input type="number" id="park" placeholder="自動推算" class="w-full text-xs font-bold text-blue-700 bg-transparent focus:outline-none mt-0.5">
+                </div>
+                <div class="bg-slate-50 p-2 rounded-xl border border-slate-200">
+                    <label class="text-[10px] text-gray-500 font-semibold block">比對坪數誤差</label>
+                    <select id="tol" class="w-full text-xs font-bold text-slate-700 bg-transparent focus:outline-none mt-0.5">
+                        <option value="0.10">極近 (±10%)</option>
+                        <option value="0.15" selected>相近 (±15%)</option>
+                        <option value="0.25">放寬 (±25%)</option>
+                    </select>
+                </div>
+            </div>
+
+            <button onclick="runQuery()" class="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 active:scale-95 transition text-white font-bold py-3 rounded-xl shadow-md flex justify-center items-center space-x-2">
+                <i class="fa-solid fa-magnifying-glass-chart"></i>
+                <span>帶出本戶資料 ＆ 執行社區比價估價</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- 讀取動畫 -->
+    <div id="loading" class="hidden flex-col items-center justify-center py-14 px-6 text-center">
+        <i class="fa-solid fa-circle-notch text-4xl text-blue-600 spin mb-3"></i>
+        <p class="text-sm font-bold text-gray-700">正在連線內政部資料庫檢索本戶與同社區實價...</p>
+        <p class="text-xs text-gray-400 mt-1">首次載入該縣市約需 5~10 秒，快取完成後僅需 0.1 秒！</p>
+    </div>
+
+    <!-- 錯誤訊息 -->
+    <div id="err" class="hidden m-4 p-4 bg-red-50 border border-red-200 text-red-600 rounded-xl text-xs font-bold"></div>
+
+    <!-- 結果區 -->
+    <div id="res" class="hidden px-3.5 mt-4 space-y-4">
+
+        <!-- 區塊 1：這間房屋的完整資料 -->
+        <div class="bg-white p-4 rounded-2xl shadow-sm border-t-4 border-blue-600">
+            <div class="flex items-center justify-between mb-1">
+                <span class="text-[11px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded font-bold" id="matchLevel"></span>
+                <span class="text-[11px] text-gray-400 font-semibold" id="buildYm"></span>
+            </div>
+            <h2 id="rAddr" class="text-base font-black text-slate-800 mt-1"></h2>
+
+            <!-- 核心坪數拆解 -->
+            <div class="grid grid-cols-4 gap-1.5 text-center bg-slate-50 p-2.5 rounded-xl mt-3 border border-slate-200">
                 <div>
-                    <span class="font-black text-lg tracking-wide">好房 AI ✕ 樂居/591/5168 實價穿透系統</span>
-                    <span class="hidden md:inline-block ml-2 text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 px-2 py-0.5 rounded-full">v9.0 Jina雲端穿透代理・繞過海外IP驗證碼</span>
+                    <p class="text-[10px] text-gray-400">權狀總坪</p>
+                    <p id="rTotalPing" class="text-sm font-black text-slate-800"></p>
+                </div>
+                <div class="border-l border-slate-200">
+                    <p class="text-[10px] text-blue-600 font-bold">扣車位建坪</p>
+                    <p id="rHousePing" class="text-sm font-black text-blue-700"></p>
+                </div>
+                <div class="border-l border-slate-200">
+                    <p class="text-[10px] text-gray-400">主建物坪</p>
+                    <p id="rMainPing" class="text-sm font-bold text-slate-700"></p>
+                </div>
+                <div class="border-l border-slate-200">
+                    <p class="text-[10px] text-gray-400">附屬+陽台</p>
+                    <p id="rSubPing" class="text-sm font-bold text-slate-700"></p>
+                </div>
+            </div>
+
+            <!-- 房屋規格細節 -->
+            <div class="grid grid-cols-3 gap-2 text-xs mt-2.5 bg-blue-50/40 p-2.5 rounded-xl border border-blue-100">
+                <div><span class="text-gray-400">格局：</span><strong id="rLayout" class="text-slate-800"></strong></div>
+                <div><span class="text-gray-400">樓層：</span><strong id="rFloor" class="text-slate-800"></strong></div>
+                <div><span class="text-gray-400">屋齡：</span><strong id="rAge" class="text-slate-800"></strong></div>
+                <div><span class="text-gray-400">型態：</span><strong id="rType" class="text-slate-800"></strong></div>
+                <div><span class="text-gray-400">車位：</span><strong id="rPark" class="text-slate-800"></strong></div>
+                <div><span class="text-gray-400">社區：</span><strong id="rManage" class="text-slate-800"></strong></div>
+            </div>
+
+            <!-- 本戶/同柱歷史成交紀錄 -->
+            <div id="histBox" class="mt-3 pt-2.5 border-t border-slate-100 hidden">
+                <p class="text-[11px] font-bold text-slate-500 mb-1.5"><i class="fa-solid fa-clock-rotate-left mr-1"></i>本戶 / 同柱標準層歷次成交紀錄：</p>
+                <div id="histList" class="space-y-1 text-[11px]"></div>
+            </div>
+        </div>
+
+        <!-- 區塊 2：估價報告 (建議售價、開價、含服務費底價) -->
+        <div class="bg-white p-4 rounded-2xl shadow-sm border-t-4 border-indigo-600">
+            <div class="flex justify-between items-center mb-2">
+                <h3 class="font-extrabold text-slate-800 text-sm"><i class="fa-solid fa-sack-dollar text-amber-500 mr-1.5"></i>房仲委託估價建議書</h3>
+                <span id="rFloorAdj" class="text-[10px] bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full font-bold"></span>
+            </div>
+            <p id="scopeNote" class="text-[11px] text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg font-bold mb-3"></p>
+
+            <!-- 三大關鍵價格卡片 -->
+            <div class="grid grid-cols-3 gap-2 text-center mb-3">
+                <!-- 1. 建議開價 -->
+                <div class="bg-amber-50/80 p-3 rounded-2xl border border-amber-200 flex flex-col justify-between">
+                    <div>
+                        <span class="text-[10px] bg-amber-200 text-amber-900 px-1.5 py-0.5 rounded font-bold">1. 建議開價</span>
+                        <p class="text-[10px] text-amber-700 mt-1">預留議價空間</p>
+                    </div>
+                    <div class="my-1.5">
+                        <p id="vAskingTotal" class="text-xl font-black text-amber-700"></p>
+                        <p class="text-[10px] text-gray-500">萬元</p>
+                    </div>
+                    <p id="vAskingUnit" class="text-[10px] font-bold text-amber-800 bg-amber-100/80 py-0.5 rounded"></p>
+                </div>
+
+                <!-- 2. 建議售價 (合理成交) -->
+                <div class="bg-gradient-to-b from-blue-600 to-indigo-700 text-white p-3 rounded-2xl shadow-md flex flex-col justify-between transform scale-[1.03]">
+                    <div>
+                        <span class="text-[10px] bg-yellow-400 text-slate-900 px-1.5 py-0.5 rounded font-extrabold">2. 建議售價</span>
+                        <p class="text-[10px] text-blue-100 mt-1">合理市場成交價</p>
+                    </div>
+                    <div class="my-1.5">
+                        <p id="vSaleTotal" class="text-2xl font-black text-white"></p>
+                        <p class="text-[10px] text-blue-200">萬元</p>
+                    </div>
+                    <p id="vSaleUnit" class="text-[10px] font-bold text-yellow-300 bg-white/15 py-0.5 rounded"></p>
+                </div>
+
+                <!-- 3. 建議底價 (含服務費) -->
+                <div class="bg-emerald-50/80 p-3 rounded-2xl border border-emerald-200 flex flex-col justify-between">
+                    <div>
+                        <span class="text-[10px] bg-emerald-200 text-emerald-900 px-1.5 py-0.5 rounded font-bold">3. 建議底價</span>
+                        <p class="text-[10px] text-emerald-700 mt-1">含仲介服務費</p>
+                    </div>
+                    <div class="my-1.5">
+                        <p id="vBottomTotal" class="text-xl font-black text-emerald-700"></p>
+                        <p class="text-[10px] text-gray-500">萬元</p>
+                    </div>
+                    <p id="vBottomUnit" class="text-[10px] font-bold text-emerald-800 bg-emerald-100/80 py-0.5 rounded"></p>
+                </div>
+            </div>
+
+            <!-- 互動式委託底價 ＆ 服務費拆算器 -->
+            <div class="bg-slate-50 p-3.5 rounded-2xl border border-slate-200 space-y-2.5">
+                <div class="flex items-center justify-between border-b border-slate-200 pb-2">
+                    <span class="text-xs font-extrabold text-slate-700"><i class="fa-solid fa-calculator text-blue-600 mr-1"></i>委託底價（含服務費）與屋主實拿拆算</span>
+                    <span class="text-[10px] text-gray-400">可即時調整參數</span>
+                </div>
+
+                <div class="grid grid-cols-2 gap-2 text-xs">
+                    <div>
+                        <label class="text-[10px] text-gray-500 font-bold block mb-0.5">賣方服務費率 (%)</label>
+                        <select id="feeRate" onchange="recalcPricing()" class="w-full bg-white border border-slate-300 rounded-lg px-2 py-1.5 font-bold text-slate-800">
+                            <option value="0.04" selected>4% (標準賣方服務費)</option>
+                            <option value="0.03">3% (優惠服務費)</option>
+                            <option value="0.02">2% (專案服務費)</option>
+                            <option value="0.05">5% (含買方統包)</option>
+                            <option value="0.06">6% (法定上限)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-[10px] text-gray-500 font-bold block mb-0.5">開價加價議價空間 (%)</label>
+                        <select id="markupRate" onchange="recalcPricing()" class="w-full bg-white border border-slate-300 rounded-lg px-2 py-1.5 font-bold text-slate-800">
+                            <option value="0.08">+8% (平實開價)</option>
+                            <option value="0.10" selected>+10% (標準議價空間)</option>
+                            <option value="0.12">+12% (充裕議價空間)</option>
+                            <option value="0.15">+15% (高開議價空間)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- 拆算結果明細 -->
+                <div class="bg-white p-3 rounded-xl border border-slate-200 text-xs space-y-1.5">
+                    <div class="flex justify-between items-center">
+                        <span class="text-gray-500">📌 委託底價總額（含服務費）：</span>
+                        <strong id="calcBottomIncl" class="text-sm font-black text-emerald-700"></strong>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-gray-500">💼 內含仲介服務費金額：</span>
+                        <strong id="calcFeeAmt" class="text-rose-600 font-bold"></strong>
+                    </div>
+                    <div class="flex justify-between items-center pt-1 border-t border-dashed border-slate-200">
+                        <span class="text-slate-800 font-bold">💰 屋主扣除服務費後【實拿淨額】：</span>
+                        <strong id="calcSellerNet" class="text-base font-black text-blue-700"></strong>
+                    </div>
+                </div>
+
+                <!-- 屋主期望實拿反推工具 -->
+                <div class="pt-1">
+                    <label class="text-[10px] text-indigo-700 font-bold block mb-1">💡 若屋主指定「扣服務費後要實拿 (萬元)」，自動反推含服務費底價：</label>
+                    <div class="flex space-x-2">
+                        <input type="number" id="customNetInput" oninput="reverseFromNet()" placeholder="輸入屋主想實拿的萬數..." class="flex-1 bg-white border border-indigo-200 rounded-lg px-2.5 py-1 text-xs font-bold focus:outline-none focus:border-indigo-500">
+                        <span id="reverseResult" class="text-xs font-extrabold text-indigo-800 bg-indigo-50 px-3 py-1 rounded-lg flex items-center whitespace-nowrap">底價(含服務費)：-- 萬</span>
+                    </div>
                 </div>
             </div>
         </div>
-    </nav>
 
-    <div class="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 text-white py-7 px-4 shadow-inner">
-        <div class="max-w-7xl mx-auto">
-            <h1 class="text-2xl md:text-3xl font-extrabold mb-2">輸入地址 ➡️ 雲端穿透抓取【樂居 / 591 / 5168】真實社區與成交行情</h1>
-            <p class="text-blue-200 text-xs md:text-sm mb-5">採用 Jina 雲端瀏覽器代理繞過搜尋引擎驗證碼，自動擷取該地址之「社區名稱、本戶室內與公設坪數、屋齡、同社區最新成交價」！</p>
-
-            <div class="bg-white p-4 rounded-2xl shadow-xl text-slate-800 grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
-                <div class="md:col-span-6">
-                    <label class="text-xs font-bold text-slate-500 block mb-1">📍 輸入完整地址</label>
-                    <input type="text" id="addr" value="台北市內湖區成功路四段180號6樓" 
-                           placeholder="例：台北市內湖區成功路四段180號6樓"
-                           class="w-full bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-blue-600">
-                </div>
-                <div class="md:col-span-2">
-                    <label class="text-xs font-bold text-slate-500 block mb-1">📐 扣車位坪數 (選填)</label>
-                    <input type="number" id="ping" placeholder="自動抓取本戶坪數" 
-                           class="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-bold focus:outline-none">
-                </div>
-                <div class="md:col-span-2">
-                    <label class="text-xs font-bold text-slate-500 block mb-1">🚗 車位價值 (萬元)</label>
-                    <input type="number" id="park" value="0" 
-                           class="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-bold focus:outline-none">
-                </div>
-                <div class="md:col-span-2">
-                    <button onclick="runQuery()" class="w-full bg-amber-500 hover:bg-amber-600 active:scale-95 transition text-slate-950 font-black py-2.5 px-4 rounded-xl shadow-md flex items-center justify-center space-x-2">
-                        <i class="fa-solid fa-magnifying-glass-chart"></i>
-                        <span>自動抓取實價</span>
-                    </button>
-                </div>
+        <!-- 區塊 3：同社區且坪數接近之實價登錄列表 -->
+        <div class="bg-white p-4 rounded-2xl shadow-sm">
+            <div class="flex justify-between items-center mb-1">
+                <h3 class="font-extrabold text-slate-800 text-sm">📋 同社區＆相近坪數實價登錄明細</h3>
+                <span id="rCount" class="text-[11px] bg-blue-100 text-blue-800 px-2.5 py-0.5 rounded-full font-bold"></span>
             </div>
+            <p class="text-[11px] text-gray-400 mb-3">優先排列【同社區、同柱戶別、坪數最接近】之真實交易（已排除特殊交易）</p>
+            <div id="list" class="space-y-2.5"></div>
         </div>
     </div>
-
-    <div class="max-w-7xl mx-auto px-4 py-8">
-        <div id="loading" class="hidden bg-white rounded-3xl p-12 text-center shadow-sm border border-slate-200 my-6">
-            <i class="fa-solid fa-circle-notch text-5xl text-amber-500 spin mb-4"></i>
-            <h3 class="text-lg font-extrabold text-slate-800">正在透過雲端代理穿透抓取 5168、591、樂居、信義實價資料...</h3>
-            <p class="text-xs text-slate-400 mt-2">正在解析該門牌之社區名稱與近一年成交紀錄，約需 5~10 秒！</p>
-        </div>
-
-        <div id="err" class="hidden bg-red-50 border-l-4 border-red-600 text-red-700 p-5 rounded-xl shadow-sm my-4 font-bold text-sm"></div>
-
-        <div id="dashboard" class="hidden grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div class="lg:col-span-5 space-y-6">
-                <div class="bg-white rounded-2xl p-6 shadow-sm border-2 border-amber-500">
-                    <div class="flex items-center justify-between mb-2">
-                        <span class="bg-amber-500 text-slate-950 text-xs font-black px-2.5 py-1 rounded-md">🏢 1. 本戶社區與房屋規格</span>
-                        <span id="rLayout" class="text-xs font-bold text-indigo-700 bg-indigo-100 px-2.5 py-1 rounded-md"></span>
-                    </div>
-                    <h2 id="rCommName" class="text-2xl font-black text-blue-900 mt-2"></h2>
-                    <p id="rAddr" class="text-sm font-bold text-slate-700 mt-0.5"></p>
-                    <p id="rAreaDetail" class="text-xs text-emerald-700 font-bold bg-emerald-50 p-2 rounded-lg border border-emerald-200 mt-2 mb-4"></p>
-
-                    <div class="grid grid-cols-2 gap-2 mb-4">
-                        <a id="lejuLink" href="#" target="_blank" class="bg-orange-500 hover:bg-orange-600 text-white text-xs font-bold py-2.5 px-3 rounded-xl text-center shadow flex items-center justify-center space-x-1">
-                            <i class="fa-solid fa-arrow-up-right-from-square"></i>
-                            <span>打開【樂居 Leju】查此門牌</span>
-                        </a>
-                        <a id="hpLink" href="#" target="_blank" class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold py-2.5 px-3 rounded-xl text-center shadow flex items-center justify-center space-x-1">
-                            <i class="fa-brands fa-google"></i>
-                            <span>打開 Google 實價結果</span>
-                        </a>
-                    </div>
-
-                    <div class="mb-4 bg-slate-50 p-2.5 rounded-xl border border-slate-200">
-                        <span class="text-[11px] font-bold text-slate-500 block mb-1.5">💡 檢索到本棟/同社區常見坪數 (點擊可立即切換坪數重算總價)：</span>
-                        <div id="pingBtns" class="flex flex-wrap gap-1.5"></div>
-                    </div>
-
-                    <div class="grid grid-cols-3 gap-2 text-center bg-amber-50/60 p-3.5 rounded-xl border border-amber-200">
-                        <div>
-                            <p class="text-[11px] text-slate-500">計算權狀坪數</p>
-                            <p id="rPing" class="text-base font-black text-blue-700 mt-0.5"></p>
-                        </div>
-                        <div class="border-l border-amber-200">
-                            <p class="text-[11px] text-slate-500">屋齡</p>
-                            <p id="rAge" class="text-base font-black text-slate-800 mt-0.5"></p>
-                        </div>
-                        <div class="border-l border-amber-200">
-                            <p class="text-[11px] text-slate-500">樓層 / 總樓層</p>
-                            <p id="rFloor" class="text-sm font-black text-slate-800 mt-1"></p>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="bg-white rounded-2xl p-6 shadow-sm border border-slate-200">
-                    <h3 class="text-base font-black text-slate-900 mb-3"><i class="fa-solid fa-sack-dollar text-amber-500 mr-2"></i>2. 這間房子價值多少錢？(成交落點)</h3>
-
-                    <div class="bg-gradient-to-br from-blue-900 to-indigo-900 text-white p-5 rounded-2xl text-center shadow-md mb-4">
-                        <p class="text-xs text-blue-200 font-semibold">預估合理成交總價落點 (中位數 PR50)</p>
-                        <div class="my-2 flex items-baseline justify-center space-x-1">
-                            <span id="medT" class="text-4xl font-black text-yellow-300"></span>
-                            <span class="text-sm font-bold">萬元</span>
-                        </div>
-                        <div class="flex justify-center space-x-4 text-xs text-blue-100 mt-2 pt-2 border-t border-blue-700/50">
-                            <span>中位數單價：<strong id="medU" class="text-white"></strong> 萬/坪</span>
-                            <span>•</span>
-                            <span>同社區均價：<strong id="avgU" class="text-white"></strong> 萬/坪</span>
-                        </div>
-                    </div>
-
-                    <div class="grid grid-cols-2 gap-3 text-center">
-                        <div class="p-3 rounded-xl bg-emerald-50 border border-emerald-200">
-                            <span class="text-xs font-extrabold text-emerald-800 block">📉 保守買方出價 (PR25)</span>
-                            <p id="lowT" class="text-lg font-black text-emerald-900 mt-1"></p>
-                            <p id="lowU" class="text-[11px] font-bold text-emerald-700"></p>
-                        </div>
-                        <div class="p-3 rounded-xl bg-amber-50 border border-amber-200">
-                            <span class="text-xs font-extrabold text-amber-800 block">📈 樂觀屋主開價 (PR75)</span>
-                            <p id="highT" class="text-lg font-black text-amber-900 mt-1"></p>
-                            <p id="highU" class="text-[11px] font-bold text-amber-700"></p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="lg:col-span-7 space-y-6">
-                <div class="bg-white rounded-2xl p-6 shadow-sm border border-slate-200">
-                    <h3 class="text-base font-black text-slate-900 mb-1">📋 3. 網路抓取之同社區與本棟實價登錄行情表</h3>
-                    <p class="text-xs text-slate-400 mb-4">直接從 5168、591、樂屋網、信義房屋擷取出之同社區各樓層真實單價紀錄</p>
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-left border-collapse">
-                            <thead>
-                                <tr class="border-b-2 border-slate-200 text-[11px] text-slate-400">
-                                    <th class="py-2 px-2">成交期別</th><th class="py-2 px-2">成交門牌 / 原始實價摘要</th>
-                                    <th class="py-2 px-2 text-right">坪數</th><th class="py-2 px-2 text-right">拆算單價</th>
-                                    <th class="py-2 px-2 text-right">成交總價</th>
-                                </tr>
-                            </thead>
-                            <tbody id="tableBody" class="divide-y divide-slate-100 text-xs"></tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <div class="bg-white rounded-2xl p-6 shadow-sm border border-slate-200">
-                    <h3 class="text-base font-black text-slate-900 mb-2">🔍 原始網頁抓取內容核對區</h3>
-                    <div id="rawSnippets" class="space-y-2 text-xs text-slate-600 bg-slate-50 p-3.5 rounded-xl border border-slate-200 max-h-60 overflow-y-auto"></div>
-                </div>
-            </div>
-        </div>
-
-        <!-- 保底神器：手動貼上樂居/591文字一秒拆算區 -->
-        <div class="mt-8 bg-white rounded-2xl p-6 shadow-sm border border-slate-300">
-            <h3 class="text-sm font-black text-slate-800 mb-1"><i class="fa-solid fa-paste text-blue-600 mr-1.5"></i>進階工具：直接從【樂居 / 591】複製文字貼上，1 秒自動算落點！</h3>
-            <p class="text-xs text-slate-500 mb-3">若您已打開樂居或 591 社區頁面，可直接全選複製頁面上的實價登錄文字貼到下方，系統會自動幫您過濾並算出 PR25 / PR50 / PR75 價格落點：</p>
-            <textarea id="pasteBox" rows="3" placeholder="在此貼上您從樂居或 591 複製的實價登錄文字（只要文字內含『XX萬/坪』即可自動識別）..." class="w-full bg-slate-50 border border-slate-300 rounded-xl p-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-600 mb-2"></textarea>
-            <button onclick="runPasteParse()" class="bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold py-2 px-4 rounded-xl shadow">解析貼上的實價文字並計算落點</button>
-        </div>
-    </div>
+</div>
 
 <script>
-function selectQuickPing(p) {
-    document.getElementById('ping').value = p;
-    runQuery();
-}
-
-function renderResult(d) {
-    const park = parseFloat(document.getElementById('park').value) || 0;
-    document.getElementById('rCommName').innerText = d.target.comm_name;
-    document.getElementById('rAddr').innerText = d.target.addr;
-    document.getElementById('rAreaDetail').innerText = "📐 面積細節：" + d.target.area_detail;
-    document.getElementById('rLayout').innerText = d.target.layout;
-    document.getElementById('rPing').innerText = d.target.ping + " 坪";
-    document.getElementById('rAge').innerText = d.target.age;
-    document.getElementById('rFloor').innerText = d.target.floors;
-
-    document.getElementById('lejuLink').href = d.target.leju_url;
-    document.getElementById('hpLink').href = d.target.houseprice_url;
-
-    const btnBox = document.getElementById('pingBtns');
-    btnBox.innerHTML = '';
-    d.target.ping_options.forEach(p => {
-        const active = Math.abs(p - d.target.ping) < 0.5;
-        btnBox.innerHTML += `
-            <button onclick="selectQuickPing(${p})" class="text-xs font-bold px-2.5 py-1 rounded-lg border transition ${active ? 'bg-blue-600 text-white border-blue-600 shadow' : 'bg-white text-slate-700 border-slate-300 hover:bg-blue-50'}">
-                ${p} 坪
-            </button>`;
-    });
-
-    document.getElementById('medT').innerText = (d.val.med_t + park).toLocaleString();
-    document.getElementById('medU').innerText = d.val.med_u;
-    document.getElementById('avgU').innerText = d.val.avg_u;
-    document.getElementById('lowT').innerText = (d.val.low_t + park).toLocaleString() + " 萬";
-    document.getElementById('lowU').innerText = `單價 ${d.val.low_u} 萬/坪`;
-    document.getElementById('highT').innerText = (d.val.high_t + park).toLocaleString() + " 萬";
-    document.getElementById('highU').innerText = `單價 ${d.val.high_u} 萬/坪`;
-
-    const tbody = document.getElementById('tableBody');
-    tbody.innerHTML = '';
-    d.comps.forEach(c => {
-        tbody.innerHTML += `
-            <tr class="hover:bg-slate-50">
-                <td class="py-3 px-2 font-bold text-emerald-700 whitespace-nowrap">${c.date}<span class="block text-[10px] text-slate-400">${c.floor}</span></td>
-                <td class="py-3 px-2">
-                    <p class="font-bold text-slate-900">${c.addr}</p>
-                    <p class="text-[10px] text-slate-400 leading-tight mt-0.5">${c.raw_snippet}</p>
-                </td>
-                <td class="py-3 px-2 text-right font-bold text-blue-700 whitespace-nowrap">${c.ping} 坪</td>
-                <td class="py-3 px-2 text-right font-black text-red-600 whitespace-nowrap">${c.unit} 萬/坪</td>
-                <td class="py-3 px-2 text-right font-bold text-slate-900 whitespace-nowrap">${c.total.toLocaleString()} 萬</td>
-            </tr>`;
-    });
-
-    const snipBox = document.getElementById('rawSnippets');
-    snipBox.innerHTML = '';
-    d.target.raw_snippets.forEach((s, i) => {
-        snipBox.innerHTML += `<div class="p-2 bg-white rounded border border-slate-100"><b>[${i+1}]</b> ${s}</div>`;
-    });
-
-    document.getElementById('dashboard').classList.remove('hidden');
-}
+let currentData = null;
 
 async function runQuery() {
     const addr = document.getElementById('addr').value.trim();
     const ping = document.getElementById('ping').value || 0;
+    const parkInput = document.getElementById('park').value;
+    const park = parkInput === "" ? -1 : parseFloat(parkInput);
+    const tol = document.getElementById('tol').value || 0.15;
 
     if (!addr) return alert("請輸入地址！");
     document.getElementById('err').classList.add('hidden');
-    document.getElementById('dashboard').classList.add('hidden');
+    document.getElementById('res').classList.add('hidden');
     document.getElementById('loading').classList.remove('hidden');
+    document.getElementById('loading').classList.add('flex');
 
     try {
-        const res = await fetch(`/api/analyze?address=${encodeURIComponent(addr)}&custom_ping=${ping}`);
+        const url = `/api/analyze?address=${encodeURIComponent(addr)}&custom_ping=${ping}&custom_park_price=${park}&ping_tol=${tol}`;
+        const res = await fetch(url);
         const d = await res.json();
         document.getElementById('loading').classList.add('hidden');
+        document.getElementById('loading').classList.remove('flex');
 
         if (d.error) {
             const errEl = document.getElementById('err');
-            errEl.innerHTML = `${d.error} <div class="mt-3 flex space-x-2"><a href="${d.leju_url || '#'}" target="_blank" class="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-xs">👉 打開【樂居 Leju】</a><a href="${d.houseprice_url || '#'}" target="_blank" class="bg-blue-600 text-white px-3 py-1.5 rounded-lg text-xs">👉 打開【Google 實價搜尋】</a></div>`;
+            errEl.innerText = d.error;
             errEl.classList.remove('hidden');
             return;
         }
-        renderResult(d);
+
+        currentData = d;
+        renderData(d);
     } catch (e) {
         document.getElementById('loading').classList.add('hidden');
-        const errEl = document.getElementById('err');
-        errEl.innerText = "連線異常，請重試一次！";
-        errEl.classList.remove('hidden');
+        document.getElementById('err').innerText = "網路連線異常，請重試。";
+        document.getElementById('err').classList.remove('hidden');
     }
 }
 
-async function runPasteParse() {
-    const text = document.getElementById('pasteBox').value.trim();
-    const addr = document.getElementById('addr').value.trim() || "自訂地址";
-    const ping = document.getElementById('ping').value || 0;
-    if (!text) return alert("請先貼上從樂居或 591 複製的實價文字！");
+function renderData(d) {
+    // 1. 渲染本戶資料
+    document.getElementById('matchLevel').innerText = d.target.match_level;
+    document.getElementById('buildYm').innerText = `建築完成：${d.target.build_ym}`;
+    document.getElementById('rAddr').innerText = d.target.addr;
+    document.getElementById('rTotalPing').innerText = `${d.target.total_ping} 坪`;
+    document.getElementById('rHousePing').innerText = `${d.target.house_ping} 坪`;
+    document.getElementById('rMainPing').innerText = d.target.main_ping > 0 ? `${d.target.main_ping} 坪` : "未拆分";
+    document.getElementById('rSubPing').innerText = d.target.sub_ping > 0 ? `${d.target.sub_ping} 坪` : "未拆分";
 
-    const res = await fetch('/api/parse_pasted', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text: text, address: addr, ping: ping})
+    document.getElementById('rLayout').innerText = d.target.layout;
+    document.getElementById('rFloor').innerText = `${d.target.floor} / 共${d.target.total_floors}`;
+    document.getElementById('rAge').innerText = `${d.target.age} 年`;
+    document.getElementById('rType').innerText = d.target.type;
+    const parkInfo = d.target.park_ping > 0 ? `${d.target.park_ping}坪 (${d.target.park_price}萬)` : "無車位";
+    document.getElementById('rPark').innerText = parkInfo;
+    document.getElementById('rManage').innerText = `${d.target.manage_org}・${d.target.elevator}`;
+
+    // 本戶歷史紀錄
+    const histBox = document.getElementById('histBox');
+    const histList = document.getElementById('histList');
+    histList.innerHTML = '';
+    if (d.target.history && d.target.history.length > 0) {
+        histBox.classList.remove('hidden');
+        d.target.history.forEach(h => {
+            histList.innerHTML += `
+                <div class="flex justify-between items-center bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200">
+                    <span class="text-slate-700 font-semibold">${h.date}｜${h.addr} <span class="text-gray-400">(建坪${h.house_ping}坪)</span></span>
+                    <span class="font-bold text-blue-700">總價 ${h.total_price} 萬 <span class="text-rose-600">(${h.unit_price}萬/坪)</span></span>
+                </div>`;
+        });
+    } else {
+        histBox.classList.add('hidden');
+    }
+
+    // 2. 渲染估價區塊
+    document.getElementById('scopeNote').innerText = d.val.scope_note;
+    document.getElementById('rFloorAdj').innerText = d.val.floor_adj_note;
+    recalcPricing();
+
+    // 3. 渲染同社區相似坪數實價列表
+    document.getElementById('rCount').innerText = `同社區 ${d.val.comm_count} 筆 / 共比對 ${d.val.total_count} 筆`;
+    const list = document.getElementById('list');
+    list.innerHTML = '';
+    d.comps.forEach(c => {
+        let badge = `<span class="bg-slate-200 text-slate-700 text-[10px] px-1.5 py-0.5 rounded font-bold">同路段相似坪數</span>`;
+        if (c.is_same_comm && c.is_same_sub) {
+            badge = `<span class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.5 rounded font-bold">★ 同社區同戶別</span>`;
+        } else if (c.is_same_comm) {
+            badge = `<span class="bg-blue-600 text-white text-[10px] px-1.5 py-0.5 rounded font-bold">🏢 同社區相似坪數</span>`;
+        }
+        const parkTxt = c.park > 0 ? `含車位 ${c.park} 萬` : `無車位或未拆分`;
+        list.innerHTML += `
+            <div class="p-3 rounded-xl border ${c.is_same_comm ? 'border-blue-300 bg-blue-50/40' : 'border-slate-200 bg-slate-50'} flex justify-between items-center">
+                <div class="pr-2 space-y-1">
+                    <div class="flex items-center flex-wrap gap-1">${badge}<span class="text-xs font-extrabold text-slate-800">${c.addr}</span></div>
+                    <div class="text-[11px] text-slate-600">
+                        📅 <b>${c.date}</b> • 扣車位 <b class="text-blue-700">${c.house_ping}坪</b> <span class="text-[10px] bg-amber-100 text-amber-800 px-1 rounded font-bold">${c.ping_diff}</span> • ${c.floor}
+                    </div>
+                    <div class="text-[10px] text-gray-400">權狀總坪 ${c.total_ping} 坪｜${c.layout}｜${parkTxt}</div>
+                </div>
+                <div class="text-right whitespace-nowrap pl-2 border-l border-slate-200">
+                    <p class="text-sm font-black text-rose-600">${c.unit} <span class="text-[10px]">萬/坪</span></p>
+                    <p class="text-xs font-extrabold text-slate-800">總價 ${c.total.toLocaleString()} 萬</p>
+                </div>
+            </div>`;
     });
-    const d = await res.json();
-    if (d.error) return alert(d.error);
-    document.getElementById('err').classList.add('hidden');
-    renderResult(d);
+
+    document.getElementById('res').classList.remove('hidden');
 }
 
-window.onload = () => {
-    runQuery();
-};
+function recalcPricing() {
+    if (!currentData) return;
+    const feeRate = parseFloat(document.getElementById('feeRate').value) || 0.04;
+    const markupRate = parseFloat(document.getElementById('markupRate').value) || 0.10;
+
+    const housePing = currentData.target.house_ping;
+    const parkPrice = currentData.target.park_price;
+    const saleTotal = currentData.val.suggested_sale;
+    const saleUnit = currentData.val.suggested_unit;
+
+    // 1. 建議開價
+    const askingTotal = Math.round(saleTotal * (1 + markupRate));
+    const askingUnit = housePing > 0 ? ((askingTotal - parkPrice) / housePing).toFixed(1) : 0;
+
+    // 2. 建議底價 (含服務費)
+    const bottomIncl = currentData.val.bottom_incl_fee;
+    const bottomUnit = housePing > 0 ? ((bottomIncl - parkPrice) / housePing).toFixed(1) : 0;
+    const feeAmt = (bottomIncl * feeRate).toFixed(1);
+    const sellerNet = (bottomIncl - feeAmt).toFixed(1);
+
+    document.getElementById('vAskingTotal').innerText = askingTotal.toLocaleString();
+    document.getElementById('vAskingUnit').innerText = `單價 ${askingUnit} 萬/坪`;
+
+    document.getElementById('vSaleTotal').innerText = saleTotal.toLocaleString();
+    document.getElementById('vSaleUnit').innerText = `單價 ${saleUnit} 萬/坪`;
+
+    document.getElementById('vBottomTotal').innerText = bottomIncl.toLocaleString();
+    document.getElementById('vBottomUnit').innerText = `單價 ${bottomUnit} 萬/坪`;
+
+    document.getElementById('calcBottomIncl').innerText = `${bottomIncl.toLocaleString()} 萬元`;
+    document.getElementById('calcFeeAmt').innerText = `${feeAmt} 萬元 (${Math.round(feeRate*100)}%)`;
+    document.getElementById('calcSellerNet').innerText = `${sellerNet} 萬元`;
+
+    // 同步更新反推預設值
+    const netInput = document.getElementById('customNetInput');
+    if (!netInput.value) {
+        netInput.value = Math.round(sellerNet);
+    }
+    reverseFromNet();
+}
+
+function reverseFromNet() {
+    const netVal = parseFloat(document.getElementById('customNetInput').value);
+    const feeRate = parseFloat(document.getElementById('feeRate').value) || 0.04;
+    const outEl = document.getElementById('reverseResult');
+    if (!netVal || netVal <= 0) {
+        outEl.innerText = "底價(含服務費)：-- 萬";
+        return;
+    }
+    // 含服務費底價 = 屋主實拿 ÷ (1 - 服務費率)
+    const reqBottom = Math.ceil(netVal / (1 - feeRate));
+    const fee = (reqBottom - netVal).toFixed(1);
+    outEl.innerText = `應簽底價：${reqBottom} 萬 (含費${fee}萬)`;
+}
 </script>
 </body>
 </html>
